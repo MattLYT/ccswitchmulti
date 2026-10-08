@@ -6096,6 +6096,7 @@ fn is_codex_client_fingerprint_header(key_str: &str) -> bool {
             | "x-openai-subagent"
             | "x-client-request-id"
             | "openai-beta"
+            | "version"
             | "openai-organization"
             | "openai-project"
     ) || key_str.starts_with("x-stainless-")
@@ -6598,8 +6599,8 @@ fn is_first_party_codex_originator(value: &str) -> bool {
 /// 可信本地 Codex 请求只有在恰好携带一个官方 first-party 值时才保留原值；缺失、
 /// 重复、未知值以及 External API/协议转换请求统一回退到官方 CLI 默认值。这样既避免
 /// `originator=cc-switch` 触发模型准入差异，也不会把 Desktop/VS Code 误报成 CLI。
-/// 保留真实 User-Agent，但不把其构建版本提升为独立的 `version` 协议头；
-/// 该头会改变上游模型准入，可能使可用模型返回 unsupported。旧的覆盖值也移除。
+/// `version` 不是 Codex 默认请求头；不要把 User-Agent 里的构建版本合成为另一个
+/// 身份头。旧配置、外部 API 或客户端自报的独立 version 均不向官方上游转发。
 fn enforce_codex_oauth_originator(
     headers: &mut http::HeaderMap,
     is_codex_official_upstream: bool,
@@ -8503,6 +8504,7 @@ fn raw_passthrough_header_should_skip(name: &http::HeaderName) -> bool {
         lower.as_str(),
         "host"
             | "content-length"
+            | "version"
             | "transfer-encoding"
             | "connection"
             | "keep-alive"
@@ -9742,6 +9744,21 @@ mod tests {
                 .get("x-user-header")
                 .and_then(|value| value.to_str().ok()),
             Some("kept")
+        );
+    }
+
+    #[test]
+    fn codex_raw_passthrough_drops_inbound_version_before_provider_overrides() {
+        let mut source = HeaderMap::new();
+        source.insert("version", HeaderValue::from_static("0.158.0-alpha.2.1"));
+        source.insert("x-user-header", HeaderValue::from_static("kept"));
+
+        let rebuilt = build_raw_passthrough_headers(&source, &[], None, None);
+
+        assert!(rebuilt.get("version").is_none());
+        assert_eq!(
+            rebuilt.get("x-user-header"),
+            Some(&HeaderValue::from_static("kept"))
         );
     }
 
@@ -11632,9 +11649,27 @@ mod tests {
     }
 
     #[test]
+    fn codex_official_identity_does_not_synthesize_alpha_version_from_user_agent() {
+        let mut headers = HeaderMap::new();
+        headers.insert("originator", HeaderValue::from_static("Codex Desktop"));
+        headers.insert(
+            http::header::USER_AGENT,
+            HeaderValue::from_static("Codex Desktop/0.158.0-alpha.2.1 (Windows 11; x86_64)"),
+        );
+
+        enforce_codex_oauth_originator(&mut headers, true, true);
+
+        assert!(headers.get("version").is_none());
+        assert_eq!(
+            headers.get("originator"),
+            Some(&HeaderValue::from_static("Codex Desktop"))
+        );
+    }
+
+    #[test]
     /// 官方 Codex 的 User-Agent 描述进程身份，originator 允许被线程级来源覆盖；
-    /// 两者不相同时也不应合成 version 头。
-    fn codex_oauth_identity_omits_version_when_thread_originator_differs_from_process() {
+    /// 两者不相同时也不额外合成 version。
+    fn codex_oauth_identity_keeps_thread_originator_without_synthesizing_version() {
         let mut headers = HeaderMap::new();
         headers.insert("originator", HeaderValue::from_static("codex_vscode"));
         headers.insert(
@@ -11654,8 +11689,8 @@ mod tests {
     }
 
     #[test]
-    /// 线程来源回退也不应从可信 User-Agent 合成 version。
-    fn codex_oauth_identity_omits_version_after_invalid_originator_fallback() {
+    /// 本地 Codex 的线程来源头即使损坏并回退到 CLI，也不额外合成 version。
+    fn codex_oauth_identity_falls_back_without_synthesizing_version() {
         let mut headers = HeaderMap::new();
         headers.insert("originator", HeaderValue::from_static("unknown-client"));
         headers.insert(
@@ -11742,7 +11777,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_native_auth_passthrough_identity_omits_version() {
+    fn codex_native_auth_passthrough_does_not_synthesize_version() {
         let mut headers = HeaderMap::new();
         headers.insert("originator", HeaderValue::from_static("Codex Desktop"));
         headers.insert(
@@ -12534,6 +12569,7 @@ mod tests {
             "x-client-request-id",
             "x-codex-window-id",
             "openai-beta",
+            "version",
             "openai-organization",
             "openai-project",
             "x-stainless-lang",
